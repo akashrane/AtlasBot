@@ -98,12 +98,10 @@ def load_countries() -> None:
         for row in reader:
             if not row:
                 continue
-            # allow plain lines or CSV with one column
             name = row[0].strip()
             if name and not name.startswith("#"):
                 rows.append(name)
 
-    # Build canonical dicts
     _COUNTRIES = [{"display": n, "canon": canon(n)} for n in rows]
 
     # Deduplicate by canon, keep first display
@@ -159,30 +157,39 @@ def detect_type(place_name: str) -> str:
 # Selection tiers (never concede early)
 # =========================
 def pick_country(letter: str) -> Optional[str]:
-    """Deterministic, fallback-safe country selection."""
+    """
+    STRICT no-repeat country picker:
+    1) Unused in indexed letter list
+    2) Unused in full country list for that letter
+    3) Repeat only if EVERYTHING for that letter is used
+    """
     load_countries()
     L = letter.lower()
-    pool = _COUNTRIES_BY_LETTER.get(L, [])
 
-    def unused(arr): return [it for it in arr if it["canon"] not in used_places]
+    def unused(arr): 
+        return [it for it in arr if it["canon"] not in used_places]
 
-    # Tier 1: Unused countries starting with L
-    t1 = unused(pool)
-    if t1:
-        return random.choice(t1)["display"]
+    # 1) Indexed pool for the letter → unused first
+    indexed = _COUNTRIES_BY_LETTER.get(L, [])
+    u1 = unused(indexed)
+    if u1:
+        return random.choice(u1)["display"]
 
-    # Tier 2: Allow repeats within that letter
-    if pool:
-        return random.choice(pool)["display"]
+    # 2) Full scan by letter → unused
+    all_for_letter = [it for it in _COUNTRIES if it["canon"].startswith(L)]
+    u2 = unused(all_for_letter)
+    if u2:
+        return random.choice(u2)["display"]
 
-    # Tier 3: emergency global scan by letter
-    gpool = [it for it in _COUNTRIES if it["canon"].startswith(L)]
-    t3 = unused(gpool)
-    if t3:
-        return random.choice(t3)["display"]
-    return random.choice(gpool)["display"] if gpool else None
+    # 3) Only now allow a repeat
+    if all_for_letter:
+        return random.choice(all_for_letter)["display"]
+    if indexed:
+        return random.choice(indexed)["display"]
 
-# Simple continent picker (rarely used)
+    # 4) Nothing exists for this letter (should not happen with our CSV)
+    return None
+
 def pick_continent(letter: str) -> Optional[str]:
     L = letter.lower()
     opts = [c for c in CONTINENTS if canon(c).startswith(L)]
@@ -222,7 +229,6 @@ def _nominatim_letter_index(letter: str, kind: str) -> List[Tuple[str, float]]:
     except Exception:
         pass
 
-    # Sort by importance, keep top 40 for quality/variety
     out.sort(key=lambda x: x[1], reverse=True)
     cache[letter] = out[:40]
     return cache[letter]
@@ -258,20 +264,17 @@ def find_place_by_letter(letter: str, user_type: str, difficulty: str) -> Option
     if user_type == "continent":
         return pick_continent(L)
 
-    # Cities + States mode
     if difficulty == "Cities + States":
         first = pick_city(L)
         if first:
             return first
         return pick_state(L)
 
-    # All Geography: prefer same type, then broaden
     if user_type == "city":
         return pick_city(L) or pick_state(L) or pick_country(L) or pick_continent(L)
     if user_type == "state":
         return pick_state(L) or pick_city(L) or pick_country(L) or pick_continent(L)
 
-    # unknown → broadest
     return pick_city(L) or pick_state(L) or pick_country(L) or pick_continent(L)
 
 def play_turn(user_place: str, difficulty: str = "All Geography"):
@@ -286,31 +289,42 @@ def play_turn(user_place: str, difficulty: str = "All Geography"):
     if cn in {"quit", "restart", "reset"}:
         return {"response": reset_game(), "map": None}
 
-    # Rule: enforce starting letter after first move
+    # 1) Letter rule first (if we’re already in-play)
     if last_required_letter and cn[:1] != last_required_letter:
-        return {"response": f"❌ Invalid move! Your place must start with **{last_required_letter.upper()}**.", "map": None}
+        return {
+            "response": f"❌ Invalid move! Your place must start with **{last_required_letter.upper()}**.",
+            "map": None,
+        }
 
-    # Detect type
+    # 2) Type detection and difficulty gates
     ptype = detect_type(name)
-
-    # Mode gate
     if difficulty == "Countries Only" and ptype != "country":
         return {"response": "🌍 Countries Only mode — please enter a **country** (e.g., India, France, Japan).", "map": None}
     if difficulty == "Cities + States" and ptype not in {"city", "state"}:
         return {"response": "🏙️ Cities + States mode — please enter a **city or state**.", "map": None}
 
-    # Record user's place
+    # 3) 🚫 NEW: disallow ANY reuse (country/city/state/continent) by either player
+    if cn in used_places:
+        return {"response": "♻️ Already used in this game! Pick a different place.", "map": None}
+
+    # 4) Accept the user's move
     used_places.add(cn)
 
-    # Find bot response
+    # 5) Compute the required letter for the bot
     last = last_alpha(name)
     if not last:
         return {"response": "⚠️ I couldn’t find a valid ending letter in that name. Try another place.", "map": None}
 
+    # 6) Bot move (strict no-repeat inside pickers)
     bot = find_place_by_letter(last, ptype, difficulty)
+
+    # Guard against accidental repeat (try once more)
+    if bot and canon(bot) in used_places:
+        alt = find_place_by_letter(last, ptype, difficulty)
+        if alt and canon(alt) not in used_places:
+            bot = alt
+
     if not bot:
-        # With our tiers this should basically never happen for countries;
-        # still keep a graceful message.
         return {"response": f"🏁 I truly couldn’t find anything starting with **{last.upper()}**. You win! 🎉", "map": None}
 
     used_places.add(canon(bot))
@@ -318,5 +332,15 @@ def play_turn(user_place: str, difficulty: str = "All Geography"):
 
     return {
         "response": f"🤖 My turn ({'country' if difficulty=='Countries Only' else ptype}): {bot}. Your next place should start with **{(last_required_letter or '—').upper()}**.",
-        "map": f"https://nominatim.openstreetmap.org/ui/search.html?q={bot.replace(' ', '+')}"
+        "map": f"https://nominatim.openstreetmap.org/ui/search.html?q={bot.replace(' ', '+')}",
+    }
+
+
+def get_state() -> dict:
+    """
+    Read-only snapshot of the game engine state for the UI.
+    """
+    return {
+        "used_places": sorted(list(used_places)),
+        "last_required_letter": last_required_letter,
     }
